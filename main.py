@@ -3,28 +3,40 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.callbacks import BaseCallbackHandler
 
 from weather_agent import build_weather_agent
-from weather_agent.config import ConfigurationError
+from weather_agent.config import ConfigurationError, Settings
+from weather_agent.observability import (
+    ProgressReporter,
+    TraceRecorder,
+    progress_context,
+    record_trace,
+)
 from weather_agent.weather_service import OpenMeteoWeatherService, WeatherServiceError
-
-
-def log_timing(stage: str, started_at: float) -> None:
-    """Write an elapsed-time record without mixing it into the answer."""
-    elapsed = perf_counter() - started_at
-    print(f"[耗时] {stage}: {elapsed:.3f} 秒", file=sys.stderr)
 
 
 class TimingCallbackHandler(BaseCallbackHandler):
     """Log individual model and tool run durations for Agent mode."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        model_name: str,
+        progress: ProgressReporter | None = None,
+    ) -> None:
+        self.run_id = run_id
+        self.model_name = model_name
+        self.progress = progress
         self._started_at: dict[Any, float] = {}
+        self._tool_calls: set[tuple[str, str]] = set()
 
     def on_chat_model_start(self, serialized: Any, messages: Any, **kwargs: Any) -> Any:
         run_id = kwargs.get("run_id")
@@ -36,7 +48,35 @@ class TimingCallbackHandler(BaseCallbackHandler):
         run_id = kwargs.get("run_id")
         started_at = self._started_at.pop(run_id, None)
         if started_at is not None:
-            log_timing("模型请求", started_at)
+            usage = self._extract_usage(response)
+            elapsed = round(perf_counter() - started_at, 3)
+            record_trace(
+                "model",
+                "request_completed",
+                model=self.model_name,
+                elapsed_seconds=elapsed,
+                input_tokens=usage.get("input_tokens", "unknown"),
+                output_tokens=usage.get("output_tokens", "unknown"),
+            )
+            if self.progress is not None:
+                self.progress.update("模型响应完成")
+
+    @staticmethod
+    def _extract_usage(response: Any) -> dict[str, Any]:
+        """Extract token usage from LangChain's possible response shapes."""
+        usage = getattr(response, "usage_metadata", None) or {}
+        if usage:
+            return usage
+
+        generations = getattr(response, "generations", None) or []
+        if generations and generations[0]:
+            message = getattr(generations[0][0], "message", None)
+            usage = getattr(message, "usage_metadata", None) or {}
+            if usage:
+                return usage
+
+        llm_output = getattr(response, "llm_output", None) or {}
+        return llm_output.get("token_usage", {}) or {}
 
     def on_tool_start(
         self,
@@ -44,6 +84,31 @@ class TimingCallbackHandler(BaseCallbackHandler):
         input_str: str,
         **kwargs: Any,
     ) -> Any:
+        tool_name = serialized.get("name", "unknown_tool")
+        try:
+            arguments = json.loads(input_str)
+        except (TypeError, json.JSONDecodeError):
+            arguments = input_str
+        normalized_arguments = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        call_key = (tool_name, normalized_arguments)
+        if call_key in self._tool_calls:
+            raise RuntimeError(
+                f"Duplicate tool call blocked: {tool_name}({normalized_arguments})"
+            )
+        self._tool_calls.add(call_key)
+        record_trace(
+            "tool",
+            "call_started",
+            tool=tool_name,
+            arguments=arguments,
+        )
+        if self.progress is not None:
+            self.progress.update(f"正在调用工具：{tool_name}")
         run_id = kwargs.get("run_id")
         if run_id is not None:
             self._started_at[run_id] = perf_counter()
@@ -53,7 +118,29 @@ class TimingCallbackHandler(BaseCallbackHandler):
         run_id = kwargs.get("run_id")
         started_at = self._started_at.pop(run_id, None)
         if started_at is not None:
-            log_timing("天气工具调用", started_at)
+            record_trace(
+                "tool",
+                "call_completed",
+                elapsed_seconds=round(perf_counter() - started_at, 3),
+            )
+            if self.progress is not None:
+                self.progress.update("工具调用完成，正在生成答案")
+
+
+def classify_agent_error(error: Exception) -> str:
+    """Map provider and runtime failures to stable user-facing categories."""
+    error_name = type(error).__name__.lower()
+    if "timeout" in error_name:
+        return "model_timeout"
+    if "ratelimit" in error_name or "rate_limit" in error_name:
+        return "rate_limit"
+    if "authentication" in error_name or "permission" in error_name:
+        return "authentication_error"
+    if "recursion" in error_name:
+        return "agent_turn_limit"
+    if "duplicate tool call" in str(error).lower():
+        return "duplicate_tool_call"
+    return "agent_error"
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -62,7 +149,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "location",
         nargs="?",
-        help="要查询的地点，例如：北京、上海浦东、Tokyo",
+        help="地点或天气问题，例如：北京、北京未来三天天气、比较北京和上海",
     )
     parser.add_argument(
         "--agent",
@@ -80,8 +167,13 @@ def extract_text(result: dict[str, Any]) -> str:
 
     content = messages[-1].content
     if isinstance(content, str):
-        return content
-    return str(content)
+        return clean_terminal_text(content)
+    return clean_terminal_text(str(content))
+
+
+def clean_terminal_text(text: str) -> str:
+    """Remove Markdown emphasis markers from terminal-facing Agent output."""
+    return text.replace("**", "")
 
 
 def format_weather(weather: dict[str, Any]) -> str:
@@ -111,36 +203,96 @@ def format_weather(weather: dict[str, Any]) -> str:
 def main() -> int:
     """Run a single weather query."""
     arguments = parse_arguments()
-    location = arguments.location or input("请输入要查询天气的地点：").strip()
-    if not location:
-        print("地点不能为空。", file=sys.stderr)
+    interactive_mode = arguments.location is None
+    try:
+        question = arguments.location or input("请输入你要询问的问题？").strip()
+    except EOFError:
+        print("未检测到输入，请重新运行程序并输入问题。", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\n已取消。", file=sys.stderr)
+        return 130
+    if not question:
+        print("问题不能为空。", file=sys.stderr)
         return 2
 
     try:
-        if arguments.agent:
-            started_at = perf_counter()
-            agent = build_weather_agent()
-            log_timing("Agent 初始化", started_at)
-
-            started_at = perf_counter()
-            result = agent.invoke(
-                {
-                    "messages": [
+        use_agent = arguments.agent or interactive_mode
+        if use_agent:
+            settings = Settings.from_environment()
+            run_id = str(uuid4())
+            session_id = str(uuid4())
+            progress = ProgressReporter()
+            with progress_context(progress), TraceRecorder(
+                run_id=run_id,
+                session_id=session_id,
+                model_name=settings.openai_model,
+            ) as trace:
+                trace.record("run", "question_received", question=question)
+                progress.update("正在初始化 Agent")
+                agent = build_weather_agent(settings)
+                trace.record("agent", "initialized")
+                progress.update("正在请求模型分析问题")
+                try:
+                    result = agent.invoke(
                         {
-                            "role": "user",
-                            "content": f"请查询并说明 {location} 当前的天气状况。",
-                        }
-                    ]
-                },
-                config={"callbacks": [TimingCallbackHandler()]},
-            )
-            log_timing("Agent 完整调用（包含模型和工具）", started_at)
-            output = extract_text(result)
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": question,
+                                }
+                            ]
+                        },
+                        config={
+                            "callbacks": [
+                                TimingCallbackHandler(
+                                    run_id=run_id,
+                                    model_name=settings.openai_model,
+                                    progress=progress,
+                                )
+                            ],
+                            "metadata": {
+                                "run_id": run_id,
+                                "session_id": session_id,
+                            },
+                            "recursion_limit": max(2, settings.agent_max_turns * 2 + 1),
+                        },
+                    )
+                except Exception as exc:
+                    trace.record(
+                        "run",
+                        "failed",
+                        error_type=classify_agent_error(exc),
+                        exception=type(exc).__name__,
+                    )
+                    progress.finish("Agent 失败")
+                    print(
+                        f"错误：Agent 执行失败，run_id={run_id}，"
+                        f"error_type={classify_agent_error(exc)}。"
+                        "可检查模型服务，或暂时使用确定性天气查询模式。",
+                        file=sys.stderr,
+                    )
+                    return 1
+                trace.record("run", "answer_ready")
+                progress.finish("完成")
+                output = extract_text(result)
         else:
-            started_at = perf_counter()
-            weather = OpenMeteoWeatherService().get_current_weather(location)
-            log_timing("直接天气查询（包含地点解析和天气请求）", started_at)
-            output = format_weather(weather)
+            run_id = str(uuid4())
+            session_id = str(uuid4())
+            progress = ProgressReporter()
+            with progress_context(progress), TraceRecorder(
+                run_id=run_id,
+                session_id=session_id,
+            ) as trace:
+                trace.record("run", "question_received", question=question)
+                try:
+                    weather = OpenMeteoWeatherService().get_current_weather(question)
+                except WeatherServiceError:
+                    progress.finish("查询失败")
+                    raise
+                trace.record("run", "answer_ready")
+                progress.finish("完成")
+                output = format_weather(weather)
     except (ConfigurationError, WeatherServiceError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
