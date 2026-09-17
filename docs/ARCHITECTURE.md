@@ -14,6 +14,7 @@
 
 - 默认路径是确定性 Workflow：地点解析 -> 天气 API -> 本地格式化。
 - `--agent` 路径是 Single Agent：模型决定调用当前天气、未来预报或多地点比较工具，工具返回结构化数据，模型生成摘要。
+- CLI 通过 `agent_platform.AgentRuntime` 执行当前 Agent；`LegacyAgentRuntime` 内部适配现有 LangChain 实现。
 
 不引入 Multi-Agent、长期 Memory 或复杂 Planning。当前工具数量和任务范围不足以证明这些复杂度有收益。
 
@@ -67,3 +68,41 @@
 - Agent 每次运行有唯一 `run_id`，模型和工具耗时可追踪。
 - 终端使用单行累计进度；详细事件写入 `observability/traces/<run_id>.jsonl`。
 - 模型服务不可用时在有限时间内失败，不无限等待。
+
+## Phase 1 Runtime Boundary
+
+当前平台抽象位于 `agent_platform/`：
+
+- `AgentDefinition`：平台拥有的 Agent 标识、版本、目标和 Tool 引用。
+- `AgentContext`：一次运行的用户问题、run/session 标识和 Runtime 配置。
+- `AgentRunResult`：与框架无关的执行结果。
+- `AgentRuntime`：平台定义的 Runtime 协议。
+- `LegacyAgentRuntime`：当前 LangChain Agent 的兼容适配器。
+
+当前不持久化 LangChain 对象，也不让 CLI 依赖 LangChain 的具体调用协议。`LangGraphAgentRuntime` 已通过 `runtime_type` 接入；现有 Agent 默认继续使用 `legacy`。
+
+LangGraph Runtime 的 Checkpoint 由 `CheckpointProvider` 提供。默认的 langgraph 配置使用平台自有的 `SQLiteCheckpointProvider`，将线程、Checkpoint、父检查点关系和状态快照写入 SQLite；`InMemoryLangGraphCheckpointProvider` 仅用于测试或明确的临时运行。Run 记录由 `RunRepository` 保存，Checkpoint 查询由 `CheckpointRepository` 提供，两者共同组成运行账本和执行现场查询能力。
+
+## Phase 3 AgentSpec Boundary
+
+Phase 3 已建立平台拥有的版本化 Agent 定义：
+
+- `AgentSpec`：Agent ID、版本、目标、Runtime、Model、Prompt、Tool 引用和执行预算。
+- `PromptSpec`：Prompt ID、版本和系统提示词。
+- `ToolReference`：稳定 Tool ID 与版本，不保存具体函数对象。
+- `AgentSpecValidator`：在 Runtime 执行前校验 Runtime 类型、Tool 注册、Schema、模型超时和运行预算。
+- `weather_agent.agent_spec.build_weather_agent_spec`：当前天气 Agent 的兼容 Spec 工厂。
+
+现有 `build_weather_agent(settings)` 仍然是兼容入口，但内部先构造和校验 `WeatherAgentSpec`。当前 Spec 仍由 Python 工厂生成，尚未进入 YAML/数据库持久化；AgentCompiler 已统一负责校验、模型/工具绑定、State Schema 和 Checkpoint 注入。
+
+## Phase 2 Model / Tool Boundary
+
+Phase 2 已建立平台自己的 Model 和 Tool 边界：
+
+- `agent_platform.models.ModelSpec`：模型 Provider、模型名称和运行预算。
+- `agent_platform.models.ModelProvider`：平台模型创建协议。
+- `LangChainModelProvider`：当前 OpenAI-compatible 模型的 LangChain 实现。
+- `agent_platform.tools.ToolSpec`：Tool ID、版本、Schema、权限、超时和重试策略。
+- `agent_platform.tools.ToolRegistry`：按稳定 Tool ID 和版本解析实现。
+
+天气 Agent 通过 `WEATHER_TOOL_REGISTRY` 获取当前天气、未来预报和多地点比较 Tool。现有 `build_weather_agent(settings)` 调用保持兼容，但模型和 Tool 的具体实现已集中到平台边界之后。下一阶段可以在不改变天气业务代码的前提下加入 AgentCompiler。

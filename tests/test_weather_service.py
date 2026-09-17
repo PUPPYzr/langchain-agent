@@ -102,6 +102,19 @@ class WeatherServiceErrorTests(unittest.TestCase):
             with self.assertRaises(ConfigurationError):
                 Settings.from_environment()
 
+    def test_unknown_runtime_type_is_rejected(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "OPENAI_API_KEY": "test-key",
+                "OPENAI_MODEL": "test-model",
+                "AGENT_RUNTIME_TYPE": "unknown",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(ConfigurationError):
+                Settings.from_environment()
+
     def test_daily_forecast_is_normalized(self) -> None:
         request = httpx.Request("GET", "https://example.test")
         response = httpx.Response(

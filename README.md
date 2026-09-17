@@ -14,6 +14,9 @@
 - 结构化 Tool 输入输出和错误分类。
 - 模型超时、有限重试、最大 Token 和 Agent 轮数限制。
 - 统一终端进度显示和按运行保存的 JSONL Trace。
+- 平台自有 Agent 抽象和 Legacy Runtime 适配层，为后续 LangGraph Runtime 留出替换边界。
+- 平台自有 ModelSpec、ModelProvider、ToolSpec 和 ToolRegistry，LangChain 仅作为适配实现。
+- 版本化 AgentSpec、PromptSpec 和运行前配置校验。
 - 单元测试、回归测试和架构/Tool/Eval 文档。
 
 ## 示例
@@ -74,6 +77,13 @@ langchain-agent/
 ├── main.py                         # CLI 入口、交互模式和进度显示
 ├── requirements.txt                # Python 依赖
 ├── .env.example                    # 脱敏配置模板
+├── agent_platform/                 # 平台领域抽象与 Runtime 适配器
+│   ├── domain.py                   # AgentDefinition、AgentContext、AgentRunResult
+│   ├── runtime.py                  # AgentRuntime 接口
+│   ├── legacy_runtime.py            # 现有 LangChain Agent 兼容运行时
+│   ├── models/                     # ModelSpec、ModelProvider 和 LangChain Adapter
+│   ├── spec/                       # AgentSpec、PromptSpec 和 Validator
+│   └── tools/                      # ToolSpec、ToolProvider 和 ToolRegistry
 ├── weather_agent/
 │   ├── agent.py                    # 模型、系统提示词和 Agent 组装
 │   ├── config.py                   # 环境变量和运行预算
@@ -168,12 +178,17 @@ python -m pip check
 当前测试覆盖：
 
 - 当前天气 Tool 错误处理
+- ModelSpec 和 ModelProvider 参数映射
+- ToolSpec 注册、解析和重复保护
+- Legacy Runtime 与 Model/Tool Registry 兼容
 - 未来预报数据归一化
 - 预报天数校验
 - 多地点部分失败
 - HTTP 超时和有限重试
 - 重复 Tool Call 阻断
 - Agent 轮数配置上限
+- AgentSpec、PromptSpec 和 ToolReference 版本校验
+- AgentSpec 的 Runtime、Tool Registry 和模型超时校验
 
 ## 架构原则
 
@@ -184,6 +199,10 @@ python -m pip check
 - 外部事实必须来自 Open-Meteo，不由模型记忆补全。
 - 模型、Tool、HTTP 和错误阶段必须可追踪。
 - 所有外部请求必须有超时，重试必须有上限。
+- LangChain 属于能力适配层，Agent Runtime 由平台抽象定义。
+- Agent 的目标、Prompt、Model、Tool 和 Runtime 通过版本化 Spec 描述。
+- 非法 Agent 配置必须在运行前校验失败。
+- 当前使用 Legacy Runtime，LangGraph 仅在后续复杂多步骤任务中按需引入。
 
 更多设计细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、[docs/TOOLS.md](docs/TOOLS.md) 和 [docs/EVALS.md](docs/EVALS.md)。
 

@@ -199,10 +199,3 @@ def compare_current_weather(locations: list[str]) -> WeatherComparisonResult:
     else:
         status = "partial"
     return WeatherComparisonResult(status=status, results=results)
-
-
-WEATHER_TOOLS = [
-    get_current_weather,
-    get_weather_forecast,
-    compare_current_weather,
-]
