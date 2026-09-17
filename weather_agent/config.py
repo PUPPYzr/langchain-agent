@@ -24,6 +24,8 @@ class Settings:
     model_max_retries: int
     model_max_completion_tokens: int
     agent_max_turns: int
+    agent_runtime_type: str = "legacy"
+    agent_checkpoint_db_path: str = "agent_runs.sqlite3"
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -38,6 +40,10 @@ class Settings:
         model_retries_value = os.getenv("MODEL_MAX_RETRIES", "0").strip()
         model_tokens_value = os.getenv("MODEL_MAX_COMPLETION_TOKENS", "400").strip()
         agent_turns_value = os.getenv("AGENT_MAX_TURNS", "4").strip()
+        runtime_type = os.getenv("AGENT_RUNTIME_TYPE", "legacy").strip().lower()
+        checkpoint_db_path = os.getenv(
+            "AGENT_CHECKPOINT_DB_PATH", "agent_runs.sqlite3"
+        ).strip() or "agent_runs.sqlite3"
 
         missing = [
             name
@@ -79,6 +85,10 @@ class Settings:
             raise ConfigurationError("AGENT_MAX_TURNS must be at least 1.")
         if agent_max_turns > 20:
             raise ConfigurationError("AGENT_MAX_TURNS must not be greater than 20.")
+        if runtime_type not in {"legacy", "langgraph"}:
+            raise ConfigurationError(
+                "AGENT_RUNTIME_TYPE must be either 'legacy' or 'langgraph'."
+            )
 
         return cls(
             openai_api_key=api_key,
@@ -89,4 +99,6 @@ class Settings:
             model_max_retries=model_retries,
             model_max_completion_tokens=model_max_completion_tokens,
             agent_max_turns=agent_max_turns,
+            agent_runtime_type=runtime_type,
+            agent_checkpoint_db_path=checkpoint_db_path,
         )

@@ -11,7 +11,14 @@ from uuid import uuid4
 
 from langchain_core.callbacks import BaseCallbackHandler
 
-from weather_agent import build_weather_agent
+from agent_platform import (
+    AgentApplicationService,
+    AgentContext,
+    CallbackEventSink,
+    SQLiteCheckpointRepository,
+    SQLiteRunRepository,
+)
+from weather_agent.agent import build_compiled_weather_agent
 from weather_agent.config import ConfigurationError, Settings
 from weather_agent.observability import (
     ProgressReporter,
@@ -129,7 +136,10 @@ class TimingCallbackHandler(BaseCallbackHandler):
 
 def classify_agent_error(error: Exception) -> str:
     """Map provider and runtime failures to stable user-facing categories."""
-    error_name = type(error).__name__.lower()
+    root_error = error
+    while root_error.__cause__ is not None:
+        root_error = root_error.__cause__
+    error_name = type(root_error).__name__.lower()
     if "timeout" in error_name:
         return "model_timeout"
     if "ratelimit" in error_name or "rate_limit" in error_name:
@@ -157,18 +167,6 @@ def parse_arguments() -> argparse.Namespace:
         help="使用大模型 Agent 处理查询；默认直接调用天气服务",
     )
     return parser.parse_args()
-
-
-def extract_text(result: dict[str, Any]) -> str:
-    """Extract readable content from the agent's final message."""
-    messages = result.get("messages") or []
-    if not messages:
-        return "Agent 没有返回消息。"
-
-    content = messages[-1].content
-    if isinstance(content, str):
-        return clean_terminal_text(content)
-    return clean_terminal_text(str(content))
 
 
 def clean_terminal_text(text: str) -> str:
@@ -230,34 +228,50 @@ def main() -> int:
             ) as trace:
                 trace.record("run", "question_received", question=question)
                 progress.update("正在初始化 Agent")
-                agent = build_weather_agent(settings)
+                compiled_agent = build_compiled_weather_agent(settings)
                 trace.record("agent", "initialized")
                 progress.update("正在请求模型分析问题")
                 try:
-                    result = agent.invoke(
-                        {
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": question,
-                                }
-                            ]
-                        },
-                        config={
-                            "callbacks": [
-                                TimingCallbackHandler(
-                                    run_id=run_id,
-                                    model_name=settings.openai_model,
-                                    progress=progress,
-                                )
-                            ],
-                            "metadata": {
-                                "run_id": run_id,
-                                "session_id": session_id,
-                            },
-                            "recursion_limit": max(2, settings.agent_max_turns * 2 + 1),
-                        },
-                    )
+                    with SQLiteRunRepository(
+                        settings.agent_checkpoint_db_path
+                    ) as run_repository, SQLiteCheckpointRepository(
+                        settings.agent_checkpoint_db_path
+                    ) as checkpoint_repository:
+                        result = AgentApplicationService(
+                            run_repository=run_repository,
+                            checkpoint_repository=checkpoint_repository,
+                        ).run(
+                            compiled_agent,
+                            AgentContext(
+                                question=question,
+                                run_id=run_id,
+                                session_id=session_id,
+                                metadata={
+                                    "runtime_config": {
+                                        "callbacks": [
+                                            TimingCallbackHandler(
+                                                run_id=run_id,
+                                                model_name=settings.openai_model,
+                                                progress=progress,
+                                            )
+                                        ],
+                                        "metadata": {
+                                            "run_id": run_id,
+                                            "session_id": session_id,
+                                        },
+                                        "recursion_limit": max(
+                                            2,
+                                            settings.agent_max_turns * 2 + 1,
+                                        ),
+                                    },
+                                    "event_sink": CallbackEventSink(
+                                        lambda event_type, **details: trace.record(
+                                            "runtime", event_type, **details
+                                        )
+                                    ),
+                                },
+                            ),
+                        )
                 except Exception as exc:
                     trace.record(
                         "run",
@@ -275,7 +289,7 @@ def main() -> int:
                     return 1
                 trace.record("run", "answer_ready")
                 progress.finish("完成")
-                output = extract_text(result)
+                output = clean_terminal_text(result.content)
         else:
             run_id = str(uuid4())
             session_id = str(uuid4())

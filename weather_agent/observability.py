@@ -122,16 +122,6 @@ class TraceRecorder:
         self.close()
 
 
-@contextmanager
-def active_trace(recorder: TraceRecorder) -> Iterator[TraceRecorder]:
-    """Make a recorder available to service and callback code in this run."""
-    token = _active_recorder.set(recorder)
-    try:
-        yield recorder
-    finally:
-        _active_recorder.reset(token)
-
-
 def record_trace(stage: str, event: str, **details: Any) -> None:
     """Record an event when a run context is active."""
     recorder = _active_recorder.get()

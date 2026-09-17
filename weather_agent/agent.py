@@ -4,45 +4,61 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI
-
+from agent_platform.checkpoints import CheckpointProvider, SQLiteCheckpointProvider
+from agent_platform.compiler import CompiledAgent, LangChainAgentCompiler
+from agent_platform.models import LangChainModelProvider, ModelProvider
+from agent_platform.spec import AgentSpec
+from agent_platform.tools import ToolRegistry
 from weather_agent.config import Settings
-from weather_agent.tools import WEATHER_TOOLS
-
-SYSTEM_PROMPT = """你是一名严谨的天气信息助手。
-
-工作规则：
-1. 当前天气问题调用 get_current_weather；未来 1 到 7 天问题调用 get_weather_forecast。
-2. 用户要求比较 2 到 5 个地点时调用 compare_current_weather，不要手动猜测或合并地点数据。
-3. 先检查工具返回的 status；只有 status 为 success 时才使用 data 中的数据。
-4. 对比结果为 partial 时，只总结成功地点，并明确说明失败地点和原因。
-5. 如果工具返回 error，不要重复调用相同工具和相同参数；根据 error_type 说明问题。
-6. 明确说明解析后的地点和天气数据对应的观测时间或预报日期。
-7. 用简洁中文总结用户请求的字段；数据中缺少的字段不要臆造。
-8. 这是天气信息，不要把一般性描述包装成灾害预警或专业安全保证。
-"""
+from weather_agent.agent_spec import build_weather_agent_spec
+from weather_agent.tool_registry import WEATHER_TOOL_REGISTRY
 
 
-def build_weather_agent(settings: Settings | None = None) -> Any:
+def build_weather_agent(
+    settings: Settings | None = None,
+    *,
+    tool_registry: ToolRegistry | None = None,
+    model_provider: ModelProvider | None = None,
+    checkpoint_provider: CheckpointProvider | None = None,
+    agent_spec: AgentSpec | None = None,
+) -> Any:
     """Build and return the configured LangChain weather agent."""
+    return build_compiled_weather_agent(
+        settings,
+        tool_registry=tool_registry,
+        model_provider=model_provider,
+        checkpoint_provider=checkpoint_provider,
+        agent_spec=agent_spec,
+    ).executable
+
+
+def build_compiled_weather_agent(
+    settings: Settings | None = None,
+    *,
+    tool_registry: ToolRegistry | None = None,
+    model_provider: ModelProvider | None = None,
+    checkpoint_provider: CheckpointProvider | None = None,
+    agent_spec: AgentSpec | None = None,
+) -> CompiledAgent:
+    """Build the validated weather Agent specification and executable graph."""
     resolved_settings = settings or Settings.from_environment()
-
-    model_options: dict[str, Any] = {
-        "model": resolved_settings.openai_model,
-        "api_key": resolved_settings.openai_api_key,
-        "temperature": resolved_settings.model_temperature,
-        "timeout": resolved_settings.model_timeout_seconds,
-        "max_retries": resolved_settings.model_max_retries,
-        "max_completion_tokens": resolved_settings.model_max_completion_tokens,
-    }
-    if resolved_settings.openai_base_url:
-        model_options["base_url"] = resolved_settings.openai_base_url
-
-    model = ChatOpenAI(**model_options)
-    return create_agent(
-        model=model,
-        tools=WEATHER_TOOLS,
-        system_prompt=SYSTEM_PROMPT,
-        name="weather-agent",
+    resolved_tool_registry = tool_registry or WEATHER_TOOL_REGISTRY
+    resolved_spec = agent_spec or build_weather_agent_spec(
+        resolved_settings,
+        tool_registry=resolved_tool_registry,
     )
+    resolved_model_provider = model_provider or LangChainModelProvider(
+        api_key=resolved_settings.openai_api_key,
+        base_url=resolved_settings.openai_base_url,
+    )
+    resolved_checkpoint_provider = checkpoint_provider
+    if resolved_checkpoint_provider is None and resolved_spec.runtime_type == "langgraph":
+        resolved_checkpoint_provider = SQLiteCheckpointProvider(
+            resolved_settings.agent_checkpoint_db_path
+        )
+    compiler = LangChainAgentCompiler(
+        model_provider=resolved_model_provider,
+        tool_provider=resolved_tool_registry,
+        checkpoint_provider=resolved_checkpoint_provider,
+    )
+    return compiler.compile(resolved_spec)

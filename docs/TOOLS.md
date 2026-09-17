@@ -65,6 +65,20 @@
 - 工具不接受模型生成的额外 URL、代码或命令。
 - 工具结果必须先检查 `status`，不能把错误数据当作天气事实。
 
+## Platform Registry
+
+天气 Tool 通过 `weather_agent.tool_registry.WEATHER_TOOL_REGISTRY` 注册到平台层，使用稳定的 Tool ID 和版本解析实现：
+
+```text
+get-current-weather v1
+get-weather-forecast v1
+compare-current-weather v1
+```
+
+Agent 业务定义只引用 Tool ID，不直接依赖具体函数对象。当前 Registry 是进程内实现，后续可替换为持久化或多租户 Registry，而不改变 Tool 调用契约。
+
+AgentSpec 通过 `ToolReference(tool_id, version)` 引用 Tool。Validator 会在运行前确认引用的 Tool、输入 Schema 和输出 Schema 都已注册，避免模型执行到一半才发现配置错误。
+
 ## `get_weather_forecast`
 
 ### Purpose
