@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from langchain.agents import create_agent
 
 from agent_platform.checkpoints import CheckpointProvider, NullCheckpointProvider
+from agent_platform.guardrails import make_guarded_tool
 from agent_platform.models import ModelProvider
 from agent_platform.spec import AgentSpec, validate_agent_spec
 from agent_platform.tools import ToolProvider
@@ -47,7 +48,12 @@ class LangChainAgentCompiler:
         validate_agent_spec(spec, self._tool_provider)
         model = self._model_provider.create_chat_model(spec.model)
         tools = [
-            self._tool_provider.resolve(reference.tool_id, reference.version).implementation
+            make_guarded_tool(
+                self._tool_provider.resolve(
+                    reference.tool_id,
+                    reference.version,
+                ).implementation
+            )
             for reference in spec.tools
         ]
         executable = create_agent(

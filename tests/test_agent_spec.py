@@ -44,6 +44,50 @@ class AgentSpecTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ToolReference("get-current-weather", version=0)
 
+    def test_agent_run_timeout_is_wider_than_model_timeout(self) -> None:
+        from weather_agent.agent_spec import build_weather_agent_spec
+        from weather_agent.config import Settings
+
+        settings = Settings(
+            openai_api_key="test-key",
+            openai_model="test-model",
+            openai_base_url=None,
+            model_temperature=0.0,
+            model_timeout_seconds=30.0,
+            model_max_retries=0,
+            model_max_completion_tokens=400,
+            agent_max_turns=4,
+        )
+
+        spec = build_weather_agent_spec(settings)
+
+        self.assertGreater(spec.timeout_seconds, spec.model.timeout_seconds)
+        self.assertEqual(
+            spec.timeout_seconds,
+            settings.model_timeout_seconds * (settings.agent_max_turns + 1),
+        )
+
+    def test_explicit_agent_run_timeout_is_honoured(self) -> None:
+        from weather_agent.agent_spec import build_weather_agent_spec
+        from weather_agent.config import Settings
+
+        settings = Settings(
+            openai_api_key="test-key",
+            openai_model="test-model",
+            openai_base_url=None,
+            model_temperature=0.0,
+            model_timeout_seconds=30.0,
+            model_max_retries=0,
+            model_max_completion_tokens=400,
+            agent_max_turns=4,
+            agent_run_timeout_seconds=120.0,
+        )
+
+        self.assertEqual(
+            build_weather_agent_spec(settings).timeout_seconds,
+            120.0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

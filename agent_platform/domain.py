@@ -5,7 +5,24 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
-RunStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
+RunStatus = Literal[
+    "pending",
+    "running",
+    "interrupted",
+    "completed",
+    "failed",
+    "cancelled",
+]
+
+# Runtime-iterable form of RunStatus for CLI choices and validation.
+RUN_STATUSES: tuple[str, ...] = (
+    "pending",
+    "running",
+    "interrupted",
+    "completed",
+    "failed",
+    "cancelled",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,3 +69,7 @@ class AgentRunTimeoutError(AgentRuntimeError):
 
 class AgentRunCancelledError(AgentRuntimeError):
     """Raised when a Run is cancelled before completion."""
+
+
+class ResumeNotAllowedError(AgentRuntimeError):
+    """Raised when a thread cannot be resumed under the platform contract."""

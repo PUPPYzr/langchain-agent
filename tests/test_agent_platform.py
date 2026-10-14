@@ -117,26 +117,38 @@ class AgentPlatformRuntimeTests(unittest.TestCase):
         self.assertEqual(spec.runtime_type, "legacy")
 
     def test_langgraph_agent_factory_defaults_to_checkpoint_provider(self) -> None:
+        import tempfile
+        from pathlib import Path
+
         class FakeModelProvider:
             def create_chat_model(self, spec):
                 return "fake-model"
 
-        settings = Settings(
-            openai_api_key="test-key",
-            openai_model="test-model",
-            openai_base_url=None,
-            model_temperature=0.0,
-            model_timeout_seconds=30.0,
-            model_max_retries=0,
-            model_max_completion_tokens=400,
-            agent_max_turns=4,
-            agent_runtime_type="langgraph",
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                openai_api_key="test-key",
+                openai_model="test-model",
+                openai_base_url=None,
+                model_temperature=0.0,
+                model_timeout_seconds=30.0,
+                model_max_retries=0,
+                model_max_completion_tokens=400,
+                agent_max_turns=4,
+                agent_runtime_type="langgraph",
+                agent_checkpoint_db_path=str(Path(directory) / "checkpoints.sqlite3"),
+            )
 
-        with patch("agent_platform.compiler.create_agent", return_value="fake-agent") as factory:
-            build_weather_agent(settings, model_provider=FakeModelProvider())
+            with patch(
+                "agent_platform.compiler.create_agent",
+                return_value="fake-agent",
+            ) as factory:
+                build_weather_agent(settings, model_provider=FakeModelProvider())
 
-        self.assertIsNotNone(factory.call_args.kwargs["checkpointer"])
+            checkpointer = factory.call_args.kwargs["checkpointer"]
+            try:
+                self.assertIsNotNone(checkpointer)
+            finally:
+                checkpointer.close()
 
 
 if __name__ == "__main__":

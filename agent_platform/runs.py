@@ -30,6 +30,7 @@ class RunRecord:
     updated_at: str
     result: AgentRunResult | None = None
     error_type: str | None = None
+    parent_run_id: str | None = None
 
     @classmethod
     def pending(
@@ -38,6 +39,7 @@ class RunRecord:
         context: AgentContext,
     ) -> "RunRecord":
         timestamp = _now()
+        parent_run_id = context.metadata.get("parent_run_id")
         return cls(
             run_id=context.run_id,
             session_id=context.session_id,
@@ -47,6 +49,7 @@ class RunRecord:
             status="pending",
             created_at=timestamp,
             updated_at=timestamp,
+            parent_run_id=str(parent_run_id) if parent_run_id is not None else None,
         )
 
     def transition(
@@ -162,12 +165,26 @@ class SQLiteRunRepository:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 result_json TEXT,
-                error_type TEXT
+                error_type TEXT,
+                parent_run_id TEXT
             )
             """
         )
         self._connection.commit()
+        self._ensure_column("agent_runs", "parent_run_id", "TEXT")
         self._lock = RLock()
+
+    def _ensure_column(self, table: str, column: str, column_type: str) -> None:
+        """Add a column to an existing table without declaring a new schema."""
+        existing = {
+            row[1]
+            for row in self._connection.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in existing:
+            self._connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+            )
+            self._connection.commit()
 
     def save(self, record: RunRecord) -> None:
         result_json = None
@@ -187,8 +204,9 @@ class SQLiteRunRepository:
                 """
                 INSERT INTO agent_runs (
                     run_id, session_id, agent_id, agent_version, runtime_type,
-                    status, created_at, updated_at, result_json, error_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, created_at, updated_at, result_json, error_type,
+                    parent_run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     session_id=excluded.session_id,
                     agent_id=excluded.agent_id,
@@ -197,7 +215,8 @@ class SQLiteRunRepository:
                     status=excluded.status,
                     updated_at=excluded.updated_at,
                     result_json=excluded.result_json,
-                    error_type=excluded.error_type
+                    error_type=excluded.error_type,
+                    parent_run_id=excluded.parent_run_id
                 """,
                 (
                     record.run_id,
@@ -210,6 +229,7 @@ class SQLiteRunRepository:
                     record.updated_at,
                     result_json,
                     record.error_type,
+                    record.parent_run_id,
                 ),
             )
             self._connection.commit()
@@ -217,7 +237,7 @@ class SQLiteRunRepository:
     def get(self, run_id: str) -> RunRecord:
         with self._lock:
             row = self._connection.execute(
-                "SELECT run_id, session_id, agent_id, agent_version, runtime_type, status, created_at, updated_at, result_json, error_type FROM agent_runs WHERE run_id = ?",
+                "SELECT run_id, session_id, agent_id, agent_version, runtime_type, status, created_at, updated_at, result_json, error_type, parent_run_id FROM agent_runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
         if row is None:
@@ -243,6 +263,7 @@ class SQLiteRunRepository:
             updated_at=row[7],
             result=result,
             error_type=row[9],
+            parent_run_id=row[10],
         )
 
     def list(self, *, session_id=None, status=None, limit=None):

@@ -12,6 +12,8 @@ from threading import Lock
 from time import perf_counter
 from typing import Any, Iterator
 
+from agent_platform.telemetry import TracingPolicy, redact
+
 TRACE_DIRECTORY = Path(__file__).resolve().parent.parent / "observability" / "traces"
 _active_recorder: ContextVar["TraceRecorder | None"] = ContextVar(
     "active_trace_recorder",
@@ -78,17 +80,32 @@ def report_progress(stage: str) -> None:
 class TraceRecorder:
     """Persist one append-only JSONL trace file for one run."""
 
-    def __init__(self, *, run_id: str, session_id: str, model_name: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        model_name: str | None = None,
+        policy: TracingPolicy | None = None,
+        directory: Path | None = None,
+    ) -> None:
         self.run_id = run_id
         self.session_id = session_id
         self.model_name = model_name
+        self.policy = policy or TracingPolicy()
         self.started_at = perf_counter()
-        TRACE_DIRECTORY.mkdir(parents=True, exist_ok=True)
-        self.path = TRACE_DIRECTORY / f"{run_id}.jsonl"
+        self._directory = directory or TRACE_DIRECTORY
+        self._directory.mkdir(parents=True, exist_ok=True)
+        self.path = self._directory / f"{run_id}.jsonl"
         self._file = self.path.open("a", encoding="utf-8")
         self._terminal_event_recorded = False
 
     def record(self, stage: str, event: str, **details: Any) -> None:
+        # A cancelled or timed-out run keeps a worker thread alive; that thread
+        # may still publish events after the trace file was closed.
+        if self._file.closed:
+            return
+        safe_details = redact(details, policy=self.policy)
         payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "elapsed_seconds": round(perf_counter() - self.started_at, 3),
@@ -97,11 +114,13 @@ class TraceRecorder:
             "model": self.model_name,
             "stage": stage,
             "event": event,
-            "details": details,
+            "error_category": safe_details.get("error_category"),
+            "attempt": safe_details.get("attempt"),
+            "details": safe_details,
         }
         self._file.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
         self._file.flush()
-        if stage == "run" and event in {"failed", "finished"}:
+        if stage == "run" and event in {"failed", "finished", "interrupted"}:
             self._terminal_event_recorded = True
 
     def close(self) -> None:

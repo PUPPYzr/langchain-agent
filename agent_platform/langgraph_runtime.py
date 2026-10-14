@@ -31,15 +31,19 @@ class LangGraphAgentRuntime(ExecutableAgentRuntime):
                 if "resume_value" in context.metadata
                 else None
             )
-            result = self._agent_factory().invoke(
-                input_payload,
-                config=self._runtime_config(context),
+            result, guard = self._guarded_call(
+                context,
+                lambda: self._agent_factory().invoke(
+                    input_payload,
+                    config=self._runtime_config(context),
+                ),
             )
-            content = self._extract_content(result)
+            run_result = self._result_from_output(context, result)
         except Exception as exc:
             self._emit(context, "run.failed", error_type=type(exc).__name__)
             from agent_platform.domain import AgentRuntimeError
 
             raise AgentRuntimeError("LangGraph Agent resume failed.") from exc
-        self._emit(context, "run.completed", content=content)
-        return self._result(context, content)
+        run_result = self._merge_guard_metadata(run_result, guard)
+        self._emit_result_event(context, run_result)
+        return run_result

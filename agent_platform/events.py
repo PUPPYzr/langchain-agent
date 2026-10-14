@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol
 
+from agent_platform.domain import AgentContext
+
 
 @dataclass(frozen=True, slots=True)
 class AgentEvent:
@@ -56,3 +58,23 @@ class CallbackEventSink:
             session_id=event.session_id,
             **dict(event.data),
         )
+
+
+def emit_event(context: AgentContext, event_type: str, **data: Any) -> None:
+    """Publish one platform event to the Run's sink when one is configured.
+
+    Every producer (runtime, application service, tool guard) uses this helper so
+    that events always carry the same ``run_id``/``session_id`` correlation and
+    land in the same trace as the Run they belong to.
+    """
+    sink = context.metadata.get("event_sink")
+    if not hasattr(sink, "publish"):
+        return
+    sink.publish(
+        AgentEvent(
+            event_type=event_type,
+            run_id=context.run_id,
+            session_id=context.session_id,
+            data=data,
+        )
+    )

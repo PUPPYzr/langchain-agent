@@ -1,0 +1,7 @@
+{"case_id": "current-weather-hefei", "query": "合肥今天天气怎么样？", "expected_tools": ["get_current_weather"], "max_tool_calls": 2, "must_mention": ["合肥"]}
+{"case_id": "forecast-beijing-3-days", "query": "北京未来三天天气怎么样？", "expected_tools": ["get_weather_forecast"], "max_tool_calls": 2, "must_mention": ["北京"]}
+{"case_id": "forecast-days-clamped", "query": "上海未来十天天气怎么样？", "expected_tools": ["get_weather_forecast"], "max_tool_calls": 2, "must_mention": ["上海"]}
+{"case_id": "compare-three-cities", "query": "比较合肥、上海、北京的天气", "expected_tools": ["compare_current_weather"], "forbidden_tools": ["get_current_weather"], "max_tool_calls": 2, "must_mention": ["合肥", "上海", "北京"]}
+{"case_id": "compare-partial-failure", "query": "比较合肥和火星的天气", "expected_tools": ["compare_current_weather"], "max_tool_calls": 2, "must_mention": ["火星"], "require_failure_disclosure": true}
+{"case_id": "unknown-location", "query": "火星今天天气怎么样？", "expected_tools": ["get_current_weather"], "max_tool_calls": 2, "must_mention": ["火星"], "require_failure_disclosure": true}
+{"case_id": "no-duplicate-tool-call", "query": "合肥天气", "expected_tools": ["get_current_weather"], "max_tool_calls": 1, "must_mention": ["合肥"]}

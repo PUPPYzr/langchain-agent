@@ -4,7 +4,6 @@ from uuid import uuid4
 
 import httpx
 
-from main import TimingCallbackHandler
 from weather_agent.config import ConfigurationError, Settings
 from weather_agent.tools import (
     compare_current_weather,
@@ -73,21 +72,6 @@ class WeatherServiceErrorTests(unittest.TestCase):
         self.assertEqual(result.error_type, "not_found")
         self.assertFalse(result.retryable)
         self.assertIsNone(result.data)
-
-    def test_duplicate_tool_call_is_blocked(self) -> None:
-        callback = TimingCallbackHandler(run_id=str(uuid4()), model_name="test")
-        callback.on_tool_start(
-            {"name": "get_current_weather"},
-            '{"location":"合肥"}',
-            run_id=str(uuid4()),
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "Duplicate tool call blocked"):
-            callback.on_tool_start(
-                {"name": "get_current_weather"},
-                '{"location":"合肥"}',
-                run_id=str(uuid4()),
-            )
 
     def test_agent_turn_budget_rejects_unbounded_value(self) -> None:
         with patch.dict(

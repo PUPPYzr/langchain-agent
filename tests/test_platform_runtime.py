@@ -7,6 +7,7 @@ from agent_platform import (
     InMemoryEventSink,
     InMemoryLangGraphCheckpointProvider,
     LangChainAgentCompiler,
+    ResumeNotAllowedError,
     RuntimeRegistry,
     SQLiteCheckpointProvider,
 )
@@ -219,6 +220,208 @@ class PlatformRuntimeTests(unittest.TestCase):
                 records = repository.list("durable-thread")
                 self.assertTrue(records)
 
+    def test_sqlite_checkpoint_migrates_legacy_snapshot_without_deleting_it(self) -> None:
+        import pickle
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "checkpoints.sqlite3")
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """
+                CREATE TABLE agent_checkpoints (
+                    thread_id TEXT NOT NULL,
+                    checkpoint_ns TEXT NOT NULL,
+                    checkpoint_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    parent_checkpoint_id TEXT,
+                    checkpoint_blob BLOB NOT NULL,
+                    metadata_blob BLOB NOT NULL,
+                    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+                )
+                """
+            )
+            checkpoint = {
+                "v": 1,
+                "id": "legacy-checkpoint",
+                "ts": "2026-01-01T00:00:00+00:00",
+                "channel_values": {"value": "preserved"},
+                "channel_versions": {},
+                "versions_seen": {},
+            }
+            connection.execute(
+                """
+                INSERT INTO agent_checkpoints VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "legacy-thread",
+                    "",
+                    checkpoint["id"],
+                    checkpoint["ts"],
+                    None,
+                    pickle.dumps(checkpoint),
+                    pickle.dumps({"source": "legacy"}),
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            provider = SQLiteCheckpointProvider(path)
+            with provider.create_checkpointer() as saver:
+                restored = saver.get_tuple(
+                    {"configurable": {"thread_id": "legacy-thread"}}
+                )
+            self.assertEqual(
+                restored.checkpoint["channel_values"]["value"],
+                "preserved",
+            )
+
+            with provider.repository() as repository:
+                record = repository.get("legacy-thread", "legacy-checkpoint")
+                self.assertEqual(record.metadata["source"], "legacy")
+                AgentApplicationService(
+                    checkpoint_repository=repository,
+                ).delete_checkpoints("legacy-thread")
+                self.assertEqual(repository.list("legacy-thread"), ())
+
+            connection = sqlite3.connect(path)
+            legacy_count = connection.execute(
+                "SELECT COUNT(*) FROM agent_checkpoints WHERE thread_id = ?",
+                ("legacy-thread",),
+            ).fetchone()[0]
+            connection.close()
+            self.assertEqual(legacy_count, 0)
+
+    def test_langgraph_interrupt_resumes_after_restart_with_pending_writes(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from typing import Annotated, TypedDict
+
+        from langchain_core.messages import AIMessage, ToolMessage
+        from langgraph.graph import END, START, StateGraph
+        from langgraph.graph.message import add_messages
+        from langgraph.types import interrupt
+
+        class ApprovalState(TypedDict, total=False):
+            messages: Annotated[list, add_messages]
+            side_effect: str
+            tool_result: ToolMessage
+            decision: str
+
+        side_effect_calls = 0
+
+        def completed_side_effect(state):
+            nonlocal side_effect_calls
+            side_effect_calls += 1
+            return {
+                "side_effect": "already-completed",
+                "tool_result": ToolMessage(
+                    content="side effect completed",
+                    tool_call_id="side-effect-call",
+                ),
+            }
+
+        def wait_for_approval(state):
+            decision = interrupt({"kind": "approval", "question": "Continue?"})
+            return {
+                "decision": decision,
+                "messages": [AIMessage(content=f"Decision: {decision}")],
+            }
+
+        def build_graph(saver):
+            builder = StateGraph(ApprovalState)
+            builder.add_node("side_effect", completed_side_effect)
+            builder.add_node("approval", wait_for_approval)
+            builder.add_edge(START, "side_effect")
+            builder.add_edge(START, "approval")
+            builder.add_edge("side_effect", END)
+            builder.add_edge("approval", END)
+            return builder.compile(checkpointer=saver)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "runs.sqlite3")
+            provider = SQLiteCheckpointProvider(path)
+            with provider.create_checkpointer() as first_saver:
+                first_graph = build_graph(first_saver)
+                first_context = AgentContext(
+                    question="Please continue",
+                    run_id="run-interrupted",
+                    session_id="thread-interrupt",
+                )
+                compiled = CompiledAgent(spec=self.spec, executable=first_graph)
+                with SQLiteRunRepository(path) as runs:
+                    interrupted = AgentApplicationService(
+                        run_repository=runs,
+                    ).run(compiled, first_context)
+                    self.assertEqual(interrupted.status, "interrupted")
+                    self.assertTrue(interrupted.metadata["interrupts"])
+                    self.assertEqual(runs.get("run-interrupted").status, "interrupted")
+
+            with provider.create_checkpointer() as second_saver:
+                pending = second_saver.get_tuple(
+                    {"configurable": {"thread_id": "thread-interrupt"}}
+                )
+                self.assertTrue(pending.pending_writes)
+                resumed_graph = build_graph(second_saver)
+                resumed_context = AgentContext(
+                    question="Resume approval",
+                    run_id="run-resumed",
+                    session_id="thread-interrupt",
+                    metadata={"resume_value": "approved"},
+                )
+                resumed_compiled = CompiledAgent(
+                    spec=self.spec,
+                    executable=resumed_graph,
+                )
+                with SQLiteRunRepository(path) as runs:
+                    resumed = AgentApplicationService(
+                        run_repository=runs,
+                    ).resume(resumed_compiled, resumed_context)
+                    self.assertEqual(resumed.status, "completed")
+                    self.assertEqual(resumed.content, "Decision: approved")
+                    self.assertEqual(runs.get("run-resumed").status, "completed")
+                self.assertEqual(side_effect_calls, 1)
+
+    def test_streamed_langgraph_interrupt_is_persisted_as_interrupted(self) -> None:
+        from typing import Annotated, TypedDict
+
+        from langgraph.graph import END, START, StateGraph
+        from langgraph.graph.message import add_messages
+        from langgraph.checkpoint.memory import InMemorySaver
+        from langgraph.types import interrupt
+
+        class ApprovalState(TypedDict, total=False):
+            messages: Annotated[list, add_messages]
+
+        def wait_for_approval(state):
+            interrupt({"kind": "approval"})
+            return {}
+
+        builder = StateGraph(ApprovalState)
+        builder.add_node("approval", wait_for_approval)
+        builder.add_edge(START, "approval")
+        builder.add_edge("approval", END)
+        graph = builder.compile(checkpointer=InMemorySaver())
+        compiled = CompiledAgent(spec=self.spec, executable=graph)
+        repository = InMemoryRunRepository()
+        context = AgentContext(
+            question="Please continue",
+            run_id="run-stream-interrupted",
+            session_id="thread-stream-interrupted",
+        )
+
+        events = list(
+            AgentApplicationService(run_repository=repository).stream(
+                compiled,
+                context,
+            )
+        )
+
+        self.assertEqual(events[-1].event_type, "run.interrupted")
+        self.assertEqual(repository.get("run-stream-interrupted").status, "interrupted")
+
     def test_application_service_tracks_completed_run(self) -> None:
         repository = InMemoryRunRepository()
         service = AgentApplicationService(run_repository=repository)
@@ -292,6 +495,15 @@ class PlatformRuntimeTests(unittest.TestCase):
         service = AgentApplicationService()
         with self.assertRaises(AgentRunTimeoutError):
             service.run(CompiledAgent(spec=short_spec, executable=SlowExecutable()), self.context)
+        with self.assertRaises(AgentRunTimeoutError):
+            service.resume(
+                CompiledAgent(spec=short_spec, executable=SlowExecutable()),
+                AgentContext(
+                    question="resume",
+                    run_id="run-resume-timeout",
+                    session_id=self.context.session_id,
+                ),
+            )
 
         cancel = Event()
         cancel.set()
@@ -303,6 +515,11 @@ class PlatformRuntimeTests(unittest.TestCase):
         )
         with self.assertRaises(AgentRunCancelledError):
             service.run(CompiledAgent(spec=self.spec, executable=FakeExecutable()), cancelled_context)
+        with self.assertRaises(AgentRunCancelledError):
+            service.resume(
+                CompiledAgent(spec=self.spec, executable=FakeExecutable()),
+                cancelled_context,
+            )
 
     def test_sqlite_run_repository_round_trips_result(self) -> None:
         import tempfile
@@ -413,6 +630,167 @@ class PlatformRuntimeTests(unittest.TestCase):
 
         self.assertEqual(type(compiled.executable).__name__, "CompiledStateGraph")
         self.assertEqual(result["messages"][-1].content, "ok")
+
+    def test_application_service_propagates_context_to_worker_thread(self) -> None:
+        from contextvars import ContextVar
+
+        marker: ContextVar[str | None] = ContextVar("marker", default=None)
+        observed: dict[str, str | None] = {}
+
+        class ContextAwareExecutable(FakeExecutable):
+            def invoke(self, payload, *, config=None):
+                observed["value"] = marker.get()
+                return super().invoke(payload, config=config)
+
+        token = marker.set("visible")
+        try:
+            AgentApplicationService().run(
+                CompiledAgent(spec=self.spec, executable=ContextAwareExecutable()),
+                self.context,
+            )
+        finally:
+            marker.reset(token)
+
+        self.assertEqual(observed["value"], "visible")
+
+    def test_verify_resumable_requires_checkpoint_and_unfinished_run(self) -> None:
+        class FakeCheckpointRepository:
+            def __init__(self, records=()):
+                self._records = records
+
+            def list(self, thread_id=None, *, limit=None):
+                if thread_id == "no-checkpoints":
+                    return ()
+                return tuple(self._records)
+
+            def get(self, thread_id, checkpoint_id=None):
+                raise KeyError(thread_id)
+
+            def delete_thread(self, thread_id):
+                return None
+
+        run_repository = InMemoryRunRepository()
+        service = AgentApplicationService(
+            run_repository=run_repository,
+            checkpoint_repository=FakeCheckpointRepository(records=[object()]),
+        )
+
+        interrupted = RunRecord.pending(
+            self.spec.to_definition(), self.context
+        ).transition("interrupted")
+        run_repository.save(interrupted)
+        self.assertEqual(service.verify_resumable("thread-1").run_id, "run-1")
+
+        run_repository.save(interrupted.transition("completed"))
+        with self.assertRaises(ResumeNotAllowedError):
+            service.verify_resumable("thread-1")
+
+        with self.assertRaises(ResumeNotAllowedError):
+            service.verify_resumable("no-checkpoints")
+
+        with self.assertRaises(ValueError):
+            service.verify_resumable("   ")
+
+    def test_sqlite_run_repository_persists_parent_run_id(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = AgentContext(
+                question="resume",
+                run_id="run-child",
+                session_id="thread-1",
+                metadata={"parent_run_id": "run-parent"},
+            )
+            with SQLiteRunRepository(str(Path(directory) / "runs.sqlite3")) as repository:
+                repository.save(
+                    RunRecord.pending(self.spec.to_definition(), context)
+                )
+                loaded = repository.get("run-child")
+
+        self.assertEqual(loaded.parent_run_id, "run-parent")
+
+    def test_langgraph_resume_without_value_passes_no_input(self) -> None:
+        executable = FakeExecutable()
+        context = AgentContext(
+            question="hello",
+            run_id="run-resume-none",
+            session_id="thread-1",
+        )
+
+        LangGraphAgentRuntime(lambda: executable).resume(
+            self.spec.to_definition(),
+            context,
+        )
+
+        self.assertIsNone(executable.received_payload)
+
+    def test_langgraph_consecutive_interrupts_require_multiple_resumes(self) -> None:
+        from typing import Annotated, TypedDict
+
+        from langchain_core.messages import AIMessage
+        from langgraph.checkpoint.memory import InMemorySaver
+        from langgraph.graph import END, START, StateGraph
+        from langgraph.graph.message import add_messages
+        from langgraph.types import interrupt
+
+        class ApprovalState(TypedDict, total=False):
+            messages: Annotated[list, add_messages]
+            approvals: list[str]
+
+        def first_approval(state):
+            value = interrupt({"step": 1})
+            return {"approvals": (state.get("approvals") or []) + [f"1:{value}"]}
+
+        def second_approval(state):
+            value = interrupt({"step": 2})
+            return {
+                "approvals": (state.get("approvals") or []) + [f"2:{value}"],
+                "messages": [AIMessage(content="done")],
+            }
+
+        builder = StateGraph(ApprovalState)
+        builder.add_node("first", first_approval)
+        builder.add_node("second", second_approval)
+        builder.add_edge(START, "first")
+        builder.add_edge("first", "second")
+        builder.add_edge("second", END)
+        graph = builder.compile(checkpointer=InMemorySaver())
+
+        service = AgentApplicationService()
+        thread_id = "thread-consecutive"
+
+        first = service.run(
+            CompiledAgent(spec=self.spec, executable=graph),
+            AgentContext(question="start", run_id="run-1", session_id=thread_id),
+        )
+        second = service.resume(
+            CompiledAgent(spec=self.spec, executable=graph),
+            AgentContext(
+                question="approve first",
+                run_id="run-2",
+                session_id=thread_id,
+                metadata={"resume_value": "a"},
+            ),
+        )
+        third = service.resume(
+            CompiledAgent(spec=self.spec, executable=graph),
+            AgentContext(
+                question="approve second",
+                run_id="run-3",
+                session_id=thread_id,
+                metadata={"resume_value": "b"},
+            ),
+        )
+
+        self.assertEqual(first.status, "interrupted")
+        self.assertEqual(second.status, "interrupted")
+        self.assertEqual(third.status, "completed")
+        self.assertEqual(third.content, "done")
+        final_state = graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        ).values
+        self.assertEqual(final_state["approvals"], ["1:a", "2:b"])
 
 
 if __name__ == "__main__":

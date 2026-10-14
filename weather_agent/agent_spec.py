@@ -58,6 +58,6 @@ def build_weather_agent_spec(
         ),
         runtime_type=settings.agent_runtime_type,
         max_turns=settings.agent_max_turns,
-        timeout_seconds=settings.model_timeout_seconds,
+        timeout_seconds=settings.resolved_agent_run_timeout_seconds,
     )
     return validate_agent_spec(spec, resolved_registry)

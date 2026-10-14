@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="天气智能体 Web 对话界面" />
+    <title>天气智能体</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app">
+      <aside class="sidebar" aria-label="会话导航">
+        <header class="sidebar__header">
+          <div class="brand">
+            <span class="brand__mark" aria-hidden="true">W</span>
+            <div>
+              <strong>天气智能体</strong>
+              <small id="context-mode">正在检测运行时…</small>
+            </div>
+          </div>
+          <button id="collapse" class="icon-btn" type="button" title="收起侧边栏" aria-label="收起侧边栏">«</button>
+        </header>
+
+        <button id="new-session" class="primary-btn" type="button">＋ 新建对话</button>
+
+        <nav aria-label="历史对话">
+          <ul id="session-list" class="session-list"></ul>
+        </nav>
+
+        <footer class="sidebar__footer">
+          <button id="settings-btn" class="ghost-btn" type="button">连接设置</button>
+          <button id="theme-btn" class="ghost-btn" type="button">切换主题</button>
+        </footer>
+      </aside>
+
+      <main class="main">
+        <button id="expand" class="icon-btn expand-btn" type="button" aria-label="展开侧边栏" hidden>»</button>
+        <section id="messages" class="messages" aria-live="polite" aria-label="对话内容"></section>
+
+        <form id="composer" class="composer">
+          <textarea
+            id="input"
+            rows="1"
+            placeholder="询问任意地点天气，例如：合肥今天天气怎么样？"
+            aria-label="输入消息"
+          ></textarea>
+          <div class="composer__actions">
+            <span id="hint" class="hint">Enter 发送 · Shift+Enter 换行</span>
+            <button id="stop" class="danger-btn" type="button" hidden>停止生成</button>
+            <button id="send" class="primary-btn" type="submit">发送</button>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <dialog id="settings" class="dialog" aria-labelledby="settings-title">
+      <h2 id="settings-title">连接设置</h2>
+      <p>
+        浏览器只保存你自己的访问密钥（服务端租户密钥）。模型密钥始终只存在于服务端环境变量中，
+        不会下发到浏览器。
+      </p>
+      <label for="api-key">访问密钥</label>
+      <input id="api-key" type="password" autocomplete="off" placeholder="team-a:••••••" />
+      <div class="dialog__actions">
+        <button id="clear-key" class="ghost-btn" type="button">清除</button>
+        <button id="save-key" class="primary-btn" type="button">保存</button>
+      </div>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" hidden></div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
